@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/dlclark/regexp2"
@@ -152,5 +153,37 @@ func reduceRepeatedPatterns(segments []SrtSegment) []SrtSegment {
 		}
 		segments[i].Text = segment.Text
 	}
+	return segments
+}
+
+func extendSegments(segments []SrtSegment) []SrtSegment {
+	const timeLayout = "15:04:05,000"
+	const minDuration = 1200 * time.Millisecond
+
+	for i := 0; i < len(segments); i++ {
+		times := strings.Split(segments[i].Time, " --> ")
+
+		startTime, err := time.Parse(timeLayout, times[0])
+		if err != nil {
+			segments[i].Err = err
+		}
+		endTime, err := time.Parse(timeLayout, times[1])
+		if err != nil {
+			segments[i].Err = err
+		}
+
+		duration := endTime.Sub(startTime)
+		if duration < minDuration {
+			endTime = startTime.Add(minDuration)
+			if i+1 < len(segments) {
+				nextSegmentStartTime, _ := time.Parse(timeLayout, strings.Split(segments[i+1].Time, " --> ")[0])
+				if endTime.After(nextSegmentStartTime) {
+					endTime = nextSegmentStartTime.Add(-50 * time.Millisecond)
+				}
+			}
+			segments[i].Time = fmt.Sprintf("%s --> %s", startTime.Format(timeLayout), endTime.Format(timeLayout))
+		}
+	}
+
 	return segments
 }

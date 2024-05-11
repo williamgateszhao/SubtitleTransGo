@@ -7,8 +7,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
-	"time"
 )
 
 func translateViaOpenAI(originalText string, referenceTranslation string, config *Config) (string, error) {
@@ -31,11 +29,12 @@ func translateViaOpenAI(originalText string, referenceTranslation string, config
 
 	// Build the request body.
 	requestBody, err := json.Marshal(map[string]interface{}{
-		"model":       config.modelName,
-		"temperature": config.temperature,
-		"top_p":       config.topP,
-		"max_tokens":  config.maxTokens,
-		"messages":    messages,
+		"model":             config.modelName,
+		"temperature":       config.temperature,
+		"top_p":             config.topP,
+		"frequency_penalty": config.frequencyPenalty,
+		"max_tokens":        config.maxTokens,
+		"messages":          messages,
 	})
 	if err != nil {
 		return "", err
@@ -90,76 +89,4 @@ func translateViaOpenAI(originalText string, referenceTranslation string, config
 	result := strings.TrimSpace(response.Choices[0].Message.Content)
 	return result, nil
 
-}
-
-func translateSrtSegmentsByLine(segments []SrtSegment, config *Config, referenceSegments ...[]SrtSegment) ([]SrtSegment, error) {
-	results := make([]SrtSegment, len(segments))
-	errChan := make(chan error, 1) // Error channel, used to receive errors from multiple goroutines.
-	var wg sync.WaitGroup          // WaitGroup is used to wait for all goroutines to complete.
-
-	ticker := time.NewTicker(time.Minute / time.Duration(config.maxRequestsPerMinute)) // Create a timer that resets every minute.
-	defer ticker.Stop()
-	concurrencyLimiter := make(chan struct{}, config.maxRequestsPerMinute) // Concurrency limiter to ensure the number of concurrent requests does not exceed maxRequestsPerMinute.
-
-	for i := 0; i < config.maxRequestsPerMinute; i++ {
-		concurrencyLimiter <- struct{}{} // Initialize the concurrency limiter
-	}
-
-	for i, segment := range segments {
-		wg.Add(1)
-		// Concurrently translate each segment.
-		go func(i int, segment SrtSegment) {
-			defer wg.Done()
-			<-concurrencyLimiter // Wait for permission from the concurrency limiter.
-			<-ticker.C           // Allow a request to proceed whenever the ticker triggers.
-
-			var translatedText string
-			var err error
-			var referenceTranslation string
-			if referenceSegments != nil {
-				referenceTranslation = referenceSegments[0][i].Text
-			}
-			switch config.translator {
-			case "openai":
-				translatedText, err = translateViaOpenAI(segment.Text, referenceTranslation, config)
-			case "coze":
-				translatedText, err = translateViaCoze(segment.Text, referenceTranslation, config)
-			}
-
-			// If an error occurs, send it to the error channel, but only receive the first error.
-			if err != nil {
-				if referenceSegments != nil {
-					translatedText = referenceSegments[0][i].Text
-				}
-
-				select {
-				case errChan <- err: // Send the error and exit.
-					//return
-				default: // If the error channel is full (an error has already been sent), ignore subsequent errors.
-				}
-
-			}
-
-			results[i] = SrtSegment{
-				ID:   segment.ID,
-				Time: segment.Time,
-				Text: translatedText,
-			}
-
-			fmt.Println(segment.ID, "\n", segment.Time, "\n", segment.Text, "\n", translatedText)
-
-			concurrencyLimiter <- struct{}{} // Release the occupied concurrency limiter resource, allowing other waiting goroutines to continue execution.
-
-		}(i, segment)
-	}
-
-	wg.Wait()
-	close(errChan) // Close the error channel after all the translation goroutines are done.
-
-	// Check if there was a translation error.
-	if err, ok := <-errChan; ok {
-		//return nil, err
-		fmt.Println("Error :", err)
-	}
-	return results, nil
 }
