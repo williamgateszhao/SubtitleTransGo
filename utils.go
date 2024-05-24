@@ -72,7 +72,7 @@ func saveSrtFile(translatedSegments []SrtSegment, originalSegments []SrtSegment,
 func checkError(err error) {
 	if err != nil {
 		fmt.Println("Error :", err)
-		os.Exit(0)
+		os.Exit(1)
 	}
 }
 
