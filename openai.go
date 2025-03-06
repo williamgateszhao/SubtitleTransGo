@@ -29,12 +29,11 @@ func translateViaOpenAI(originalText string, referenceTranslation string, config
 
 	// Build the request body.
 	requestBody, err := json.Marshal(map[string]interface{}{
-		"model":             config.modelName,
-		"temperature":       config.temperature,
-		"top_p":             config.topP,
-		"frequency_penalty": config.frequencyPenalty,
-		"max_tokens":        config.maxTokens,
-		"messages":          messages,
+		"model":       config.modelName,
+		"temperature": config.temperature,
+		"top_p":       config.topP,
+		"max_tokens":  config.maxTokens,
+		"messages":    messages,
 	})
 	if err != nil {
 		return "", err

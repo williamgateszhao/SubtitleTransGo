@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/dlclark/regexp2"
+	"golang.org/x/text/unicode/norm"
 )
 
 func readSrtFile(filepath string) ([]SrtSegment, error) {
@@ -115,13 +116,15 @@ func isRepeatedChar(s string) bool {
 		return false
 	}
 
-	runeValue, size := utf8.DecodeRuneInString(s)
+	normalized := norm.NFKC.String(s)
+
+	runeValue, size := utf8.DecodeRuneInString(normalized)
 	if runeValue == utf8.RuneError {
 		return false
 	}
 
-	for i := size; i < len(s); i += size {
-		r, sSize := utf8.DecodeRuneInString(s[i:])
+	for i := size; i < len(normalized); i += size {
+		r, sSize := utf8.DecodeRuneInString(normalized[i:])
 		if r != runeValue || sSize != size {
 			return false
 		}
@@ -131,34 +134,46 @@ func isRepeatedChar(s string) bool {
 }
 
 // This function reduces the number of repeated patterns (words) in the Text field
-// of an SrtSegment that contain 2 to 4 characters and are repeated more than twice.
+// of an SrtSegment that contain 2 to 6 characters and are repeated more than twice.
 func reduceRepeatedPatterns(segments []SrtSegment) []SrtSegment {
-	regex := regexp2.MustCompile(`(([\S]{2,4})\2{3,})`, 0)
+	// Corrected regular expression: matches patterns of 2-6 non-whitespace characters that are repeated more than twice.
+	// ([\S]{2,6}) Captures a group consisting of 2-6 non-whitespace characters.
+	// \1{2,} Indicates that the group is repeated at least twice (occurs 3 times or more in total).
+	regex := regexp2.MustCompile(`([\S]{2,6})(\1{2,})`, 0)
+
 	for i, segment := range segments {
+		normalizedText := norm.NFKC.String(segment.Text)
 		for {
-			m, _ := regex.FindStringMatch(segment.Text)
+			m, _ := regex.FindStringMatch(normalizedText)
 			if m == nil {
 				break
 			}
 
 			// Extract the matched substring
 			match := m.String()
-			word := m.Groups()[2].String()
-
-			// Build a new string that repeats only twice
+			// Extract the repeated basic pattern (word)
+			word := m.Groups()[1].String()
+			// Only keep the pattern repeated twice
 			newStr := word + word
-
 			// Replace the matched part in the original string
-			segment.Text = strings.Replace(segment.Text, match, newStr, 1)
+			normalizedText = strings.Replace(normalizedText, match, newStr, 1)
 		}
-		segments[i].Text = segment.Text
+		// Update segment's Text field
+		segments[i].Text = norm.NFKC.String(normalizedText)
 	}
+
 	return segments
 }
 
+// extendSegments adjusts the timing of SRT segments to ensure a minimum display duration, potentially extending beyond 1200ms.
+// The function iterates through each segment, aiming for a minimum duration of 1200 milliseconds.
+// If a segment's initial duration is shorter, its end time is extended based on the text length, up to a maximum of 3000ms.
+// To prevent overlap, the end time is further adjusted if it would otherwise exceed the subsequent segment's start time.
 func extendSegments(segments []SrtSegment) []SrtSegment {
 	const timeLayout = "15:04:05,000"
 	const minDuration = 1200 * time.Millisecond
+	const maxDuration = 3000 * time.Millisecond
+	const durationPerChar = 100 * time.Millisecond
 
 	for i := 0; i < len(segments); i++ {
 		times := strings.Split(segments[i].Time, " --> ")
@@ -174,7 +189,17 @@ func extendSegments(segments []SrtSegment) []SrtSegment {
 
 		duration := endTime.Sub(startTime)
 		if duration < minDuration {
-			endTime = startTime.Add(minDuration)
+			textLength := len(segments[i].Text)
+			extendedDuration := time.Duration(textLength) * durationPerChar
+
+			if extendedDuration < minDuration {
+				extendedDuration = minDuration
+			}
+			if extendedDuration > maxDuration {
+				extendedDuration = maxDuration
+			}
+
+			endTime = startTime.Add(extendedDuration)
 			if i+1 < len(segments) {
 				nextSegmentStartTime, _ := time.Parse(timeLayout, strings.Split(segments[i+1].Time, " --> ")[0])
 				if endTime.After(nextSegmentStartTime) {
