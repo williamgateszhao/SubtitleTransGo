@@ -212,3 +212,11 @@ func extendSegments(segments []SrtSegment) []SrtSegment {
 
 	return segments
 }
+
+// replacePlaceholders replaces all occurrences of keys in the input string with their associated values.
+func replacePlaceholders(input string, replacements map[string]string) string {
+	for placeholder, value := range replacements {
+		input = strings.ReplaceAll(input, placeholder, value)
+	}
+	return input
+}

@@ -9,109 +9,30 @@ import (
 	"time"
 )
 
-func translateSrtSegmentsByLine(segments []SrtSegment, config *Config, referenceSegments ...[]SrtSegment) []SrtSegment {
+// translateSrtSegmentsInBatches processes and translates SRT segments in batches with rate limiting
+// and concurrency control. It combines segments up to the maximum token limit, translates them
+// using the configured translator, and handles retries for failed translations. If singleLine mode
+// is enabled, failed batch translations will be retried individually. Returns the translated segments
+// with the same structure as the input, preserving original metadata.
+func translateSrtSegmentsInBatches(segments []SrtSegment, referenceSegments []SrtSegment, config *Config) []SrtSegment {
 	results := make([]SrtSegment, len(segments))
-	copy(results, segments)
+	copy(results, segments) // Pre-populate with original data to simplify later assignments
 
 	var completedSegments int32
-	// WaitGroup is used to wait for all goroutines to complete.
 	var wg sync.WaitGroup
+	var mu sync.Mutex
 
-	// Create a timer that resets every minute.
-	ticker := time.NewTicker(time.Minute / time.Duration(config.maxRequestsPerMinute))
-	defer ticker.Stop()
-	// Concurrency limiter to ensure the number of concurrent requests does not exceed maxRequestsPerMinute.
-	concurrencyLimiter := make(chan struct{}, config.maxRequestsPerMinute)
-	for i := 0; i < config.maxRequestsPerMinute; i++ {
-		// Initialize the concurrency limiter
-		concurrencyLimiter <- struct{}{}
-	}
-
-	for i, segment := range segments {
-		wg.Add(1)
-		// Concurrently translate each segment.
-		go func(i int, segment SrtSegment) {
-			defer wg.Done()
-			<-concurrencyLimiter // Wait for permission from the concurrency limiter.
-			<-ticker.C           // Allow a request to proceed whenever the ticker triggers.
-
-			var translatedText string
-			var err error
-			var referenceTranslation string
-			if referenceSegments != nil {
-				referenceTranslation = referenceSegments[0][i].Text
-			}
-			switch config.translator {
-			case "openai":
-				translatedText, err = translateViaOpenAI(segment.Text, referenceTranslation, config)
-			}
-
-			results[i].Text = translatedText
-			fmt.Println(segment.ID, "\n", segment.Time, "\n", segment.Text, "\n", translatedText)
-			if err != nil {
-				results[i].Err = err
-				fmt.Println(err.Error())
-			}
-			progress := atomic.AddInt32(&completedSegments, 1)
-			percentage := float32(progress) / float32(len(segments)) * 100
-			fmt.Printf(" %0.2f%% completed\n", percentage)
-			// Release the occupied concurrency limiter resource, allowing other waiting goroutines to continue execution.
-			concurrencyLimiter <- struct{}{}
-		}(i, segment)
-	}
-
-	wg.Wait()
-
-	return results
-}
-
-func translateSrtSegmentsInBatches(segments []SrtSegment, config *Config) []SrtSegment {
-	results := make([]SrtSegment, len(segments))
-	copy(results, segments)
-
-	//Assuming that a token has at least two characters,
-	//and that input and output require double tokens,
-	//the token that can be input is half of the maximum token,
-	//so it is safe to take the maximum token for the maximum characters that can be entered
-	maxChars := int(config.maxTokens)
+	// Setup rate limiting
 	maxRequestsPerMinute := config.maxRequestsPerMinute
-	if config.translator == "google" {
-		maxChars = 5000 // Google Translate web only accepts up to 5000 characters
-		maxRequestsPerMinute = 3
-	}
-
-	var completedSegments int32
-	var wg sync.WaitGroup // WaitGroup is used to wait for all goroutines to complete.
-
-	pattern := `(?ms)^(\d+)\n(\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3})\n(.*?)(?:\n\n|\z)`
-	re := regexp.MustCompile(pattern)
-
-	ticker := time.NewTicker(time.Minute / time.Duration(maxRequestsPerMinute)) // Create a ticker that resets every minute.
+	ticker := time.NewTicker(time.Minute / time.Duration(maxRequestsPerMinute))
 	defer ticker.Stop()
-	concurrencyLimiter := make(chan struct{}, maxRequestsPerMinute) // Concurrency limiter to ensure we do not exceed maxRequestsPerMinute.
-	for i := 0; i < maxRequestsPerMinute; i++ {
-		concurrencyLimiter <- struct{}{} // Initialize the concurrency limiter
-	}
+
+	// Limit concurrent requests
+	concurrencyLimiter := make(chan struct{}, maxRequestsPerMinute)
+	defer close(concurrencyLimiter)
 
 	for startIndex := 0; startIndex < len(segments); {
-		var combinedText string
-		endIndex := startIndex
-
-		// Combine text for each batch, ensuring we do not exceed the max character limit.
-		for endIndex < len(segments) {
-			seg := segments[endIndex]
-			block := seg.ID + "\n" + seg.Time + "\n" + seg.Text
-
-			if len(combinedText) != 0 {
-				combinedText += "\n\n" // Use double newline as separator
-			}
-			//Combine segments' texts ensuring the total does not exceed the character limit
-			if len(combinedText)+len(block) > maxChars {
-				break
-			}
-			combinedText += block
-			endIndex++
-		}
+		combinedText, combinedReference, endIndex := combineText(segments, referenceSegments, startIndex, int(config.maxTokens))
 
 		if combinedText == "" {
 			fmt.Println("single segment too large to process: ", len(segments[startIndex].Text), "characters")
@@ -119,89 +40,181 @@ func translateSrtSegmentsInBatches(segments []SrtSegment, config *Config) []SrtS
 		}
 
 		wg.Add(1)
-		// Translate each segment in parallel.
-		go func(startIndex, endIndex int, combinedText string) {
+		concurrencyLimiter <- struct{}{} // Acquire semaphore
+
+		// Process batch in a goroutine
+		go func(startIndex, endIndex int, combinedText, combinedReference string) {
 			defer wg.Done()
-			<-concurrencyLimiter
+			defer func() { <-concurrencyLimiter }() // Release semaphore
 
-			var translatedCombinedText string
-			var err error
-
-			// Add retry logic
-			//If the translation result is deemed invalid (error marker present or translation count mismatch), retry up to a maximum number of attempts.
-			maxRetries := 5
-			retryCount := 1
-			var translatedBlocks [][]string
-			for {
-				<-ticker.C // Wait for the ticker on each attempt
-
-				switch config.translator {
-				case "google":
-					translatedCombinedText, err = translateViaGoogle(combinedText)
-				case "openai":
-					translatedCombinedText, err = translateViaOpenAI(combinedText, "", config)
-				}
-
-				// Check if it is an error response
-				needRetry := false
-				// Check if it starts with an error tag
-				if strings.HasPrefix(translatedCombinedText, "[STGERROR]") {
-					needRetry = true
-				} else {
-					translatedBlocks = re.FindAllStringSubmatch(translatedCombinedText, -1)
-					if len(translatedBlocks) < (endIndex - startIndex) {
-						needRetry = true
-					} else {
-						// Check if the length of each segment exceeds three times the original text
-						for i := startIndex; i < endIndex && i-startIndex < len(translatedBlocks); i++ {
-							translatedText := translatedBlocks[i-startIndex][3]
-							originalText := segments[i].Text
-
-							if len(translatedText) > len(originalText)*3 {
-								fmt.Printf("Segment %d translation too long: %d chars vs %d chars (original). Retrying...\n", i, len(translatedText), len(originalText))
-								needRetry = true
-								break
-							}
-						}
-					}
-				}
-
-				if needRetry && retryCount <= maxRetries {
-					retryCount++
-					fmt.Printf("Retrying batch (attempt %d/%d)...\n", retryCount, maxRetries)
-					continue // Continue the loop, retry the batch
-				}
-				// Exit the loop if there is no error or the maximum number of retries has been reached
-				break
-			}
+			translatedSegments, err := translateSegments(startIndex, endIndex, combinedText, combinedReference, config, ticker)
 
 			if err != nil {
+				// Batch failed: Retry each segment individually
+				if config.singleLine {
+					for i := startIndex; i < endIndex; i++ {
+						concurrencyLimiter <- struct{}{}
+
+						fmt.Printf("Retrying ID %s in single line mode\n", segments[i].ID)
+						translatedSingleLine, err := translateSegments(i, i+1, formatSegment(segments[i]), "", config, ticker)
+
+						mu.Lock()
+						if err != nil {
+							if results[i].Err == nil {
+								results[i].Err = err
+							}
+						} else {
+							results[i].Text = translatedSingleLine[0].Text
+						}
+						printProgress(segments[i], results[i], len(segments), &completedSegments)
+						mu.Unlock()
+
+						<-concurrencyLimiter
+					}
+				} else {
+					mu.Lock()
+					// If not in single line mode, mark all segments as failed
+					for i := startIndex; i < endIndex; i++ {
+						results[i].Err = err
+						printProgress(segments[i], results[i], len(segments), &completedSegments)
+					}
+					mu.Unlock()
+				}
+			} else { // Batch succeeded
+				mu.Lock()
 				for i := startIndex; i < endIndex; i++ {
-					results[i].Err = err
+					idx := i - startIndex
+					if idx < len(translatedSegments) {
+						results[i].Text = translatedSegments[idx].Text
+					} else if results[i].Err == nil {
+						results[i].Err = fmt.Errorf("no translation available for this segment")
+					}
+					printProgress(segments[i], results[i], len(segments), &completedSegments)
 				}
+				mu.Unlock()
 			}
+		}(startIndex, endIndex, combinedText, combinedReference)
 
-			// Assign the translated lines back to the segments
-			for i := startIndex; i < endIndex; i++ {
-				if i-startIndex < len(translatedBlocks) {
-					results[i].Text = translatedBlocks[i-startIndex][3]
-				}
-				fmt.Println(segments[i].ID, "\n", segments[i].Time, "\n", segments[i].Text, "\n", results[i].Text)
-				if results[i].Err != nil {
-					fmt.Println(results[i].Err.Error())
-				}
-				progress := atomic.AddInt32(&completedSegments, 1)
-				percentage := float32(progress) / float32(len(segments)) * 100
-				fmt.Printf(" %0.2f%% completed\n", percentage)
-			}
-
-			concurrencyLimiter <- struct{}{}
-		}(startIndex, endIndex, combinedText)
-
-		startIndex = endIndex // Set up for the next batch.
+		startIndex = endIndex // Move to next batch
 	}
 
 	wg.Wait()
-
 	return results
+}
+
+func combineText(segments []SrtSegment, referenceSegments []SrtSegment, startIndex int, maxChars int) (string, string, int) {
+	var combinedText, combinedReference string
+	endIndex := startIndex
+
+	// Combine segments until reaching character limit
+	for endIndex < len(segments) {
+		// Format current segment as a block
+		block := formatSegment(segments[endIndex])
+
+		// Format corresponding reference segment if available
+		blockReference := ""
+		if endIndex < len(referenceSegments) {
+			blockReference = formatSegment(referenceSegments[endIndex])
+		}
+
+		// Check if adding these blocks would exceed the character limit
+		separator := ""
+		referenceSeparator := ""
+		if len(combinedText) > 0 {
+			separator = "\n\n" // Use double newline as separator
+		}
+		if len(combinedReference) > 0 {
+			referenceSeparator = "\n\n"
+		}
+
+		totalLength := len(combinedText) + len(separator) + len(block) +
+			len(combinedReference) + len(referenceSeparator) + len(blockReference)
+
+		if totalLength > maxChars {
+			break
+		}
+
+		// Add separator and block
+		combinedText += separator + block
+		combinedReference += referenceSeparator + blockReference
+		endIndex++
+	}
+
+	return combinedText, combinedReference, endIndex
+}
+
+func translateSegments(startIndex int, endIndex int, combinedText string, combinedReference string, config *Config, ticker *time.Ticker) ([]SrtSegment, error) {
+	for retryCount := 1; retryCount <= config.maxRetries; retryCount++ {
+		<-ticker.C // Wait for the ticker on each attempt
+
+		// Perform translation based on configured translator
+		translatedText, err := config.TranslatorImpl.translate(combinedText, combinedReference, config)
+
+		// Check for translation issues
+		needRetry, translatedBlocks, retryReason := checkTranslationResult(translatedText, err, startIndex, endIndex)
+
+		if !needRetry {
+			// Translation successful, extract segments
+			translatedSegments := make([]SrtSegment, 0, len(translatedBlocks))
+			for _, match := range translatedBlocks {
+				translatedSegments = append(translatedSegments, SrtSegment{
+					Text: match[3],
+				})
+			}
+			return translatedSegments, nil
+		}
+
+		// Handle retry logic
+		if retryCount < config.maxRetries {
+			fmt.Printf("Retrying batch (attempt %d/%d): %s\n", retryCount, config.maxRetries, retryReason)
+			// Add exponential backoff for retries
+			time.Sleep(time.Duration(retryCount) * time.Second)
+		}
+	}
+
+	return nil, fmt.Errorf("failed to translate segments after %d attempts", config.maxRetries)
+}
+
+// checkTranslationResult validates the translation output
+func checkTranslationResult(translatedText string, err error, startIndex, endIndex int) (bool, [][]string, string) {
+	pattern := `(?m)^(\d+)\n(\d{2}.*?\d{2}.*?\d{2}.*?-+>.*?\d{2}.*?\d{2}.*?\d{3})\n(.*?)(?:\n\n|\z)`
+	re := regexp.MustCompile(pattern)
+	translatedText = strings.Replace(translatedText, "\u200b", "", -1)
+	// Check for error response
+	if err != nil {
+		return true, nil, fmt.Sprintf("Translation error: %v", err)
+	}
+
+	// Check if it starts with an error tag
+	if strings.HasPrefix(translatedText, "[STGERROR]") {
+		return true, nil, fmt.Sprintf("Error response received: %s", translatedText)
+	}
+
+	// Check segment count
+	translatedBlocks := re.FindAllStringSubmatch(translatedText, -1)
+	expectedCount := endIndex - startIndex
+	if len(translatedBlocks) != expectedCount {
+		return true, nil, fmt.Sprintf("Expected %d translated segments but got %d",
+			expectedCount, len(translatedBlocks))
+	}
+
+	// Translation is valid
+	return false, translatedBlocks, ""
+}
+
+func printProgress(segment, result SrtSegment, len int, completedSegments *int32) {
+	fmt.Printf("%s\n%s\n%s\n%s\n",
+		segment.ID,
+		segment.Time,
+		segment.Text,
+		result.Text)
+
+	progress := atomic.AddInt32(completedSegments, 1)
+	percentage := float32(progress) / float32(len) * 100
+	fmt.Printf(" %.2f%% completed\n", percentage)
+}
+
+// Helper function to format a segment as a block
+func formatSegment(segment SrtSegment) string {
+	return segment.ID + "\n" + segment.Time + "\n" + segment.Text
 }
